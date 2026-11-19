@@ -1,0 +1,11 @@
+[package]
+name = "trav-gguf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+memmap2.workspace = true
+thiserror.workspace = true
+half.workspace = true

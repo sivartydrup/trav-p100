@@ -1,0 +1,3 @@
+ctx = 8192
+prefill_cols = 8
+attn_splits = 12
