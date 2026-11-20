@@ -434,6 +434,30 @@ __device__ unsigned long long reduce_logit_key(unsigned long long key) {
     return key;
 }
 
+extern "C" __global__ void penalize_repeated_logits(float* logits, int vocab,
+                                                    const unsigned int* recent,
+                                                    int n_recent, float penalty) {
+    __shared__ unsigned int ids[256];
+    const int i = threadIdx.x;
+    if (i < n_recent) ids[i] = recent[i];
+    __syncthreads();
+    if (i >= n_recent || ids[i] >= vocab) return;
+    const unsigned int id = ids[i];
+
+    // One writer per token, including when the history repeats an ID. Apply
+    // each penalty with its original rounding, as in the host sampler.
+    for (int j = 0; j < i; ++j) {
+        if (ids[j] == id) return;
+    }
+    float value = logits[id];
+    for (int j = i; j < n_recent; ++j) {
+        if (ids[j] == id) {
+            value = value > 0.0f ? __fdiv_rn(value, penalty) : value * penalty;
+        }
+    }
+    logits[id] = value;
+}
+
 extern "C" __global__ void argmax_logits(const float* logits, int n,
                                          unsigned long long* partial) {
     unsigned long long best = 0;
@@ -828,8 +852,16 @@ gemm_f16_body(const __half* __restrict__ W, int64_t row_stride,
     const int t = threadIdx.x;
     const int tx = t % CG;
     const int ty = t / CG;
-    const int mb = blockIdx.x * TM;
-    const int nb = blockIdx.y * TN;
+    // Schedule nearby column tiles together so they can reuse weights in L2.
+    // A short final row group uses only the tiles that actually exist.
+    constexpr int ROW_TILES_PER_GROUP = 4;
+    const int linear = blockIdx.y * gridDim.x + blockIdx.x;
+    const int group_size = ROW_TILES_PER_GROUP * gridDim.y;
+    const int first_row = (linear / group_size) * ROW_TILES_PER_GROUP;
+    const int rows_in_group = min(ROW_TILES_PER_GROUP, (int)gridDim.x - first_row);
+    const int within = linear % group_size;
+    const int mb = (first_row + within % rows_in_group) * TM;
+    const int nb = (within / rows_in_group) * TN;
 
     // fp32 partials, then the fp16 chain; the chain is indexed [column][row] so
     // that, for the column held fixed in the inner loop, consecutive rows land
@@ -881,18 +913,21 @@ gemm_f16_body(const __half* __restrict__ W, int64_t row_stride,
             if (vldB[s]) sb[s].u = pb[s][st * (BK2 / 4)];
         }
     };
+    // XOR the row index by the K fragment to spread the shared stores across banks.
     auto sstore = [&](int buf) {
         #pragma unroll
         for (int s = 0; s < NPA; s++) {
             if (!vldA[s]) continue;
-            uint32_t* a = &As[buf][chA[s] * 4][rowA[s]];
+            const int row = rowA[s] ^ (chA[s] << 3);
+            uint32_t* a = &As[buf][chA[s] * 4][row];
             #pragma unroll
             for (int j = 0; j < 4; j++) a[j * TM] = sa[s].w[j];
         }
         #pragma unroll
         for (int s = 0; s < NPB; s++) {
             if (!vldB[s]) continue;
-            uint32_t* b = &Bs[buf][chB[s] * 4][rowB[s]];
+            const int row = rowB[s] ^ (chB[s] << 3);
+            uint32_t* b = &Bs[buf][chB[s] * 4][row];
             #pragma unroll
             for (int j = 0; j < 4; j++) b[j * TN] = sb[s].w[j];
         }
@@ -901,16 +936,19 @@ gemm_f16_body(const __half* __restrict__ W, int64_t row_stride,
         #pragma unroll
         for (int k2 = 0; k2 < BK2; k2++) {
             uint32_t a[RR], b[CC];
-            const uint4 a0 = *(const uint4*)(&As[buf][k2][ty * 4]);
-            const uint4 b0 = *(const uint4*)(&Bs[buf][k2][tx * 4]);
+            const int swizzle = (k2 / 4) << 3;
+            const int ai = (ty * 4) ^ swizzle;
+            const int bi = (tx * 4) ^ swizzle;
+            const uint4 a0 = *(const uint4*)(&As[buf][k2][ai]);
+            const uint4 b0 = *(const uint4*)(&Bs[buf][k2][bi]);
             a[0] = a0.x; a[1] = a0.y; a[2] = a0.z; a[3] = a0.w;
             b[0] = b0.x; b[1] = b0.y; b[2] = b0.z; b[3] = b0.w;
             if (RR == 8) {
-                const uint4 a1 = *(const uint4*)(&As[buf][k2][ty * 4 + NH]);
+                const uint4 a1 = *(const uint4*)(&As[buf][k2][ai + NH]);
                 a[4] = a1.x; a[5] = a1.y; a[6] = a1.z; a[7] = a1.w;
             }
             if (CC == 8) {
-                const uint4 b1 = *(const uint4*)(&Bs[buf][k2][tx * 4 + NQ]);
+                const uint4 b1 = *(const uint4*)(&Bs[buf][k2][bi + NQ]);
                 b[4] = b1.x; b[5] = b1.y; b[6] = b1.z; b[7] = b1.w;
             }
             #pragma unroll
@@ -935,16 +973,25 @@ gemm_f16_body(const __half* __restrict__ W, int64_t row_stride,
     gload(0);
     sstore(0);
     __syncthreads();
-    for (int st = 0; st < nt; st++) {
-        const int buf = st & 1;
-        if (st + 1 < nt) gload(st + 1);
-        tile(buf);
-        if ((st & 7) == 7 || st + 1 == nt) fold();
-        if (st + 1 < nt) {
-            // The previous stage's barrier retired all reads of this buffer.
-            sstore(buf ^ 1);
+    // Each barrier publishes the buffer just written and retires all reads
+    // of the other buffer. Pair stages to give the compiler fixed addresses.
+    for (int st = 0; st + 1 < nt; st += 2) {
+        gload(st + 1);
+        tile(0);
+        sstore(1);
+        __syncthreads();
+
+        if (st + 2 < nt) gload(st + 2);
+        tile(1);
+        if ((st & 7) == 6 || st + 2 == nt) fold();
+        if (st + 2 < nt) {
+            sstore(0);
             __syncthreads();
         }
+    }
+    if (nt & 1) {
+        tile(0);
+        fold();
     }
 
     #pragma unroll

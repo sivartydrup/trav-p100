@@ -5,7 +5,11 @@ use crate::driver::{CUdeviceptr, CuError};
 use crate::{launch, Buf, Device, Function, LaunchArgs, Module, Stream, CUDA_SUCCESS};
 
 pub const QK_K: usize = 256;
-pub const ARGMAX_BLOCKS: usize = 112;
+const ARGMAX_BLOCKS: usize = 112;
+pub const ARGMAX_TOKEN_OFFSET: usize = ARGMAX_BLOCKS * 8;
+const GREEDY_RECENT_OFFSET: usize = ARGMAX_TOKEN_OFFSET + 4;
+pub const GREEDY_MAX_RECENT: usize = 256;
+pub const GREEDY_SCRATCH_BYTES: usize = GREEDY_RECENT_OFFSET + GREEDY_MAX_RECENT * 4;
 
 /// Repack a GGUF Q6_K tensor (210-byte blocks) into the 224-byte layout the
 /// kernel consumes:
@@ -92,6 +96,7 @@ fn pick_split(blocks: usize, slots: usize, max_split: usize) -> usize {
 pub struct Kernels {
     _module: Module,
     pub prep_act: Function,
+    penalize_repeated_logits: Function,
     argmax_logits: Function,
     argmax_finish: Function,
     pub rms_norm: Function,
@@ -146,6 +151,7 @@ impl Kernels {
         }
         Ok(Kernels {
             prep_act: k("prep_act"),
+            penalize_repeated_logits: k("penalize_repeated_logits"),
             argmax_logits: k("argmax_logits"),
             argmax_finish: k("argmax_finish"),
             rms_norm: k("rms_norm"),
@@ -207,6 +213,36 @@ impl Kernels {
 
     /// `out[c][row] = sum_k W[row][k] * Y[c][k] + bias[row]`
     #[allow(clippy::too_many_arguments)]
+    pub fn penalize_recent(
+        &self,
+        logits: &Buf,
+        offset: usize,
+        vocab: usize,
+        recent: &[u32],
+        penalty: f32,
+        scratch: &Buf,
+    ) -> crate::Result<()> {
+        assert!(recent.len() <= GREEDY_MAX_RECENT);
+        // u32 token IDs are copied to the device in native byte order.
+        let recent_bytes = unsafe {
+            std::slice::from_raw_parts(recent.as_ptr().cast::<u8>(), recent.len() * 4)
+        };
+        scratch.upload_at(GREEDY_RECENT_OFFSET, recent_bytes)?;
+        let mut input = logits.ptr_at(offset);
+        let mut n = vocab as i32;
+        let mut recent_ids = scratch.ptr_at(GREEDY_RECENT_OFFSET);
+        let mut count = recent.len() as i32;
+        let mut scale = penalty;
+        let mut args = LaunchArgs::new();
+        args.push(&mut input)
+            .push(&mut n)
+            .push(&mut recent_ids)
+            .push(&mut count)
+            .push(&mut scale);
+        launch(&self.penalize_repeated_logits, (1, 1, 1),
+               (GREEDY_MAX_RECENT as u32, 1, 1), 0, None, &mut args)
+    }
+
     pub fn argmax(
         &self,
         logits: &Buf,
@@ -223,7 +259,7 @@ impl Kernels {
                (256, 1, 1), 0, None, &mut args)?;
 
         let mut blocks = ARGMAX_BLOCKS as i32;
-        let mut token = scratch.ptr_at(ARGMAX_BLOCKS * 8);
+        let mut token = scratch.ptr_at(ARGMAX_TOKEN_OFFSET);
         let mut args = LaunchArgs::new();
         args.push(&mut partial).push(&mut blocks).push(&mut token);
         launch(&self.argmax_finish, (1, 1, 1), (256, 1, 1), 0, None, &mut args)

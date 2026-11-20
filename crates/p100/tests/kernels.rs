@@ -1323,8 +1323,8 @@ fn gemv_split_bandwidth() {
 fn greedy_argmax_matches_host() {
     let Some(dev) = have_gpu() else { return };
     let kernels = Kernels::load(&dev).unwrap();
-    let partial_bytes = trav_p100::kernels::ARGMAX_BLOCKS * 8;
-    let scratch = dev.alloc(partial_bytes + 4).unwrap();
+    use trav_p100::kernels::{ARGMAX_TOKEN_OFFSET, GREEDY_SCRATCH_BYTES};
+    let scratch = dev.alloc(GREEDY_SCRATCH_BYTES).unwrap();
     let vocab = 152_064;
     let mut logits = vec![-10.0f32; vocab + 1];
     for (first, value, expected) in [
@@ -1341,7 +1341,58 @@ fn greedy_argmax_matches_host() {
         let device_logits = dev.upload(as_bytes(&logits)).unwrap();
         kernels.argmax(&device_logits, 4, vocab, &scratch).unwrap();
         let mut token = [0u32];
-        scratch.download_at(partial_bytes, as_bytes_mut(&mut token)).unwrap();
+        scratch.download_at(ARGMAX_TOKEN_OFFSET, as_bytes_mut(&mut token)).unwrap();
         assert_eq!(token[0] as usize, expected);
+    }
+}
+
+#[test]
+fn greedy_repetition_penalty_matches_host() {
+    let Some(dev) = have_gpu() else { return };
+    let kernels = Kernels::load(&dev).unwrap();
+    let scratch = dev.alloc(trav_p100::kernels::GREEDY_SCRATCH_BYTES).unwrap();
+    let logits = [9.0f32, 4.0, -3.0, 8.0, 0.0];
+    let tokens = [0u32, 2, 2, 0, 0, 4, 99, 1];
+    let penalty = 1.05;
+    let mut expected = logits;
+    for id in tokens {
+        if let Some(v) = expected.get_mut(id as usize) {
+            *v = if *v > 0.0 { *v / penalty } else { *v * penalty };
+        }
+    }
+    let device_logits = dev.upload(as_bytes(&logits)).unwrap();
+    kernels.penalize_recent(&device_logits, 0, logits.len(), &tokens, penalty, &scratch).unwrap();
+    let mut got = [0.0f32; 5];
+    device_logits.download_to(as_bytes_mut(&mut got)).unwrap();
+    assert_eq!(got.map(f32::to_bits), expected.map(f32::to_bits));
+}
+
+#[test]
+fn gemm_f16_handles_partial_tiles_and_unpaired_stage() {
+    let Some(dev) = have_gpu() else { return };
+    let kernels = Kernels::load(&dev).unwrap();
+    let (rows, cols, k) = (529usize, 145usize, 96usize);
+    let stride = rows.next_multiple_of(4);
+    let weight = |row: usize| (row % 7) as f32 - 3.0;
+    let activation = |col: usize| (col % 5) as f32 - 2.0;
+    let w: Vec<f16> = (0..rows * k).map(|i| f16::from_f32(weight(i / k))).collect();
+    let y: Vec<f16> = (0..cols * k).map(|i| f16::from_f32(activation(i / k))).collect();
+    let ys_stride = k / 16;
+    let ys = vec![0.5f32; cols * ys_stride * 2];
+    let bias: Vec<f32> = (0..rows).map(|row| row as f32 / 8.0).collect();
+    let bw = dev.upload(as_bytes(&w)).unwrap();
+    let by = dev.upload(as_bytes(&y)).unwrap();
+    let bys = dev.upload(as_bytes(&ys)).unwrap();
+    let bb = dev.upload(as_bytes(&bias)).unwrap();
+    let out = dev.alloc(cols * stride * 4).unwrap();
+    kernels.gemm_f16(&dev, &bw, k, &by, k, &bys, ys_stride, Some(&bb), &out, stride,
+                     rows, k, cols, None).unwrap();
+    let mut got = vec![0.0f32; cols * stride];
+    out.download_to(as_bytes_mut(&mut got)).unwrap();
+    for col in 0..cols {
+        for row in 0..rows {
+            let expected = weight(row) * activation(col) * k as f32 * 0.5 + bias[row];
+            assert_eq!(got[col * stride + row], expected, "row {row}, column {col}");
+        }
     }
 }

@@ -180,7 +180,7 @@ impl Scratch {
             ayh: dev.alloc_zeroed(tc * ff * 2)?,
             ays: dev.alloc_zeroed(tc * (ff / 16) * 8)?,
             logits: dev.alloc(tc * hp.vocab * 4)?,
-            argmax: dev.alloc(trav_p100::kernels::ARGMAX_BLOCKS * 8 + 4)?,
+            argmax: dev.alloc(trav_p100::kernels::GREEDY_SCRATCH_BYTES)?,
             ids: dev.alloc(tc * 4)?,
             pos: dev.alloc(tc * 4)?,
             inv_freq: inv_buf,
@@ -308,16 +308,26 @@ impl Engine {
 
     /// Advance the sequence and sample from the last token's logits.
     pub fn step_sample(&mut self, s: &mut Seq, toks: &[u32]) -> Result<u32> {
+        let mut recent = 0;
+        if s.params.repeat_penalty != 1.0 {
+            recent = s.params.repeat_last_n.min(s.tokens.len() + toks.len());
+        }
         if s.params.temperature <= 0.0
-            && (s.params.repeat_penalty == 1.0 || s.params.repeat_last_n == 0)
+            && recent <= trav_p100::kernels::GREEDY_MAX_RECENT
             && std::env::var_os("TRAV_CPU_GREEDY").is_none()
         {
             let off = self.forward(s, toks, 1)?;
             let d = self.model.out_dev;
             let sc = &self.scratch[d];
-            self.model.kernels[d].argmax(&sc.logits, off, self.model.hp.vocab, &sc.argmax)?;
+            let kf = &self.model.kernels[d];
+            let vocab = self.model.hp.vocab;
+            if recent != 0 {
+                kf.penalize_recent(&sc.logits, off, vocab, &s.tokens[s.tokens.len() - recent..],
+                                   s.params.repeat_penalty, &sc.argmax)?;
+            }
+            kf.argmax(&sc.logits, off, vocab, &sc.argmax)?;
             let mut token = [0u32];
-            sc.argmax.download_at(trav_p100::kernels::ARGMAX_BLOCKS * 8,
+            sc.argmax.download_at(trav_p100::kernels::ARGMAX_TOKEN_OFFSET,
                                   as_bytes_mut(&mut token))?;
             return Ok(token[0]);
         }
