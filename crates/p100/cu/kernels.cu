@@ -892,10 +892,10 @@ gemm_f16_body(const __half* __restrict__ W, int64_t row_stride,
         tile(buf);
         if ((st & 7) == 7 || st + 1 == nt) fold();
         if (st + 1 < nt) {
-            __syncthreads();
+            // The previous stage's barrier retired all reads of this buffer.
             sstore(buf ^ 1);
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     #pragma unroll
