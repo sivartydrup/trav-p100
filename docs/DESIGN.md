@@ -101,9 +101,10 @@ The single-column GEMV over the projection shapes Qwen2.5-7B actually launches
 | down_proj | 3584 × 18944 | 349 | 0.11 |
 | lm_head | 152064 × 3584 | 366 | 0.84 |
 
-Summed over 28 layers plus lm_head that is 12.3 ms/token, against 15.4 ms
-measured — so ~3 ms is launch gaps and non-weight work. Sixteen launches per
-layer (448 per token) at a few microseconds each accounts for most of it. The
+Summed over 28 layers plus lm_head that is 12.3 ms/token; the full untraced
+step now measures 13.4 ms, so launch gaps and the kernels the sweep does not
+cover add ~1 ms. Before the step was captured as a graph, the sixteen launches
+per layer (448 per token) at a few microseconds each were most of that gap. The
 kernel itself sits at 46–62% of the ~594 GB/s streaming rate, so the decode
 headroom is split between the access pattern (one warp per row reads 144-byte
 blocks, not 128-byte sectors) and launch count, not activation staging.
@@ -132,8 +133,9 @@ So the real kernel's 399 GB/s is 14% below its own read-only ceiling, and that
 would reach only 485. That rules out shared-memory weight staging: it buys
 485/466 = 1.04x on the read side while turning one 16-byte memory instruction
 into three (LDG + STS + LDS), in a kernel whose design budget is one load per
-16 weight bytes. The remaining decode headroom is the ~0.9 ms/token of launch
-and host gap, not the weight fetch.
+16 weight bytes. The remaining decode headroom was the ~0.9 ms/token of launch
+and host gap at the time; the CUDA graph and GPU-side greedy selection have cut
+that to ~0.3 ms, so the weight fetch is the larger lever now.
 
 Two kernels were grid-starved rather than resource-starved. `rms_norm` and
 `add_rms_norm` take `blockIdx.x` as the row, so the decode call (one row) ran 8
@@ -179,9 +181,9 @@ output, an atomic accumulate and a second launch. 3584 rows q4_k: rows 2 =
 the `nsplit` parameter so the sweep keeps pinning it, and the kernel's atomic
 path is covered by the reference tests (`nsplit` 2 and 3).
 
-Getting the rule right was worth 68.9 → 71.9 tok/s: the old table asked for 8
-rows on the 18944-row projections and 2 on q6_k, where 4 rows and 4 rows are
-best.
+Getting the rule right was worth 68.9 → 71.9 tok/s at the time (73.8 tok/s
+today): the old table asked for 8 rows on the 18944-row projections and 2 on
+q6_k, where 4 rows and 4 rows are best.
 
 
 #### The decode step as a CUDA graph
@@ -207,18 +209,20 @@ Not captured: prefill tiles, `TRAV_DUMP` runs, and multi-device layer splits —
 the residual hop between devices is a blocking copy and would have to become
 async first. `TRAV_NO_GRAPH=1` forces the plain path for A/B comparison.
 
-Measured with that switch, three reps each, interleaved: **71.79 and 71.57 tok/s
-with graphs, 71.56 and 71.39 without** — about +0.3%. The reason is that the
-launch gap this was meant to remove is not where the time went. Summing kernel
-durations from an `nsys` trace of the same 136 tokens gives 13.59 ms per token
-against a 13.97 ms wall: the step is 97% GPU-busy and only 0.4 ms per token is
-spent between kernels. What is left there is the GPU-side hand-off between 424
-dependent kernels, which a graph does not remove — fewer, larger kernels would.
+Measured with that switch, three reps each: **73.62 tok/s with graphs, 73.43
+without** — about +0.3%. The reason is that the launch gap this was meant to
+remove is not where the time went. Summing kernel durations from an `nsys` trace
+gives 97.6% GPU-busy and ~0.3 ms per token between kernels, but node-level graph
+tracing serialises the replay and makes the profiled step ~7% slower than an
+untraced one (14.4 ms of kernels against a 14.7 ms wall; untraced the step is
+13.4 ms), so read the trace as a share measurement. What is left in that gap is
+the GPU-side hand-off between ~424 dependent kernels, which a graph does not
+remove — fewer, larger kernels would.
 
-The decode budget per token is then 13.6 ms of kernels: 10.5 ms streaming
-weights, 1.3 ms of attention, norm, activation prep, SiLU and RoPE, and 1.8 ms of
-the packed kernels running a little slower in situ than in the isolated sweep
-(q/o at 319 GB/s is the main one).
+Within the trace, 86% of the step is weight GEMV (12.3 ms: 5.6 ms on the
+3584-row q4_k projections, 3.3 ms on the q6_k down projection, 3.1 ms on the
+512-row k/v), 4.8% is attention (0.7 ms) and 9.5% is norm, activation prep,
+SiLU, RoPE and KV write (1.4 ms).
 
 ### 2.4 Prefill
 
@@ -240,10 +244,10 @@ registers* so stage `s+1`'s global loads overlap stage `s`'s compute, and a fold
 to fp32 every 256 k values. Each k-pair costs four `LDS.128` for 64 `HFMA2`.
 Fragments are two 16-byte loads 64 entries apart rather than one 32-byte load:
 a 16-byte stride across the warp spreads its 16 chunks over the 32 banks twice
-instead of four times. Measured with 512 columns on the shapes the model
-launches: q/o **12.2 TFLOPS**, gate/up **12.0**, down (q6_k) **12.7**. The
-8 × 8 tile needs ~165 registers, so one block (8 warps) is resident per SM; an
-ablation probe (since removed) measured the same loop at **15.6 TFLOPS** with
+instead of four times. Measured with 512 columns on the gate/up shape
+(18944 × 3584, q4_k): **13.6 TFLOPS** (`gemm_f16_rate`). The 8 × 8 tile needs
+~222 registers, so one block (8 warps) is resident per SM; an
+ablation probe on the pre-barrier kernel (since removed) measured the same loop at **15.6 TFLOPS** with
 the shared loads and the staging deleted, and 12.9 with the loads but no
 staging. Narrower register tiles that admit two blocks per SM (64 × 128 with
 8 × 4, or 128 × 128 with 4 × 8) measure within 1% of the wide one, so the
@@ -253,7 +257,7 @@ wider fragment stays.
 values, the same lane task the packed kernels use, so the values are written as
 four 16-byte stores rather than 32 two-byte ones. It reads the packed weights
 once and writes the fp16 copy (12.5 GiB per prefill for q4_k + q6_k) at
-~250 GB/s. This is 8.5% of prefill; llama.cpp's equivalent step is 14%.
+~250 GB/s. This is 9% of prefill; llama.cpp's equivalent step is 14%.
 
 **Why not fuse it.** The fused dequantise+GEMM is still in the tree and still
 runs k/v, but its staging (dequantise + activation copy + two barriers per
@@ -267,23 +271,24 @@ four floats at a time and targets `max|x| ≈ 2^3` (it was 2^6). The smaller
 target keeps the fp16 chains far from overflow, which is what allows a fold
 every 256 k values instead of every 128.
 
-**Measured** (one P100, pp512): **762 tok/s**, 1.31 ms per token. That is
-~1.0 ms of fp16 GEMM, ~0.10 ms of dequantise, 0.09 ms of prefill attention,
-0.04 ms of activation prep and 0.08 ms of lm_head, norm and launch overhead. The
-fused path still handles k/v and any tile shorter than 24 tokens (8-column
-GEMV).
+**Measured** (one P100, pp512): **823 tok/s**, 1.22 ms per token. That is
+0.93 ms of fp16 GEMM, 0.11 ms of dequantise, 0.09 ms of prefill attention,
+0.03 ms of activation prep, 0.03 ms of fused k/v GEMM and 0.03 ms of SiLU,
+norms, RoPE, embedding and lm_head. The fused path still handles k/v and any
+tile shorter than 24 tokens (8-column GEMV).
 
 Against llama.cpp's prefill (443 ms GEMM + 87 ms dequantise + 25 ms attention
 for pp512), the dequantise step is cheaper here and attention is 2× more
-expensive; the difference that remains is the GEMM itself, 12.0–12.7 TFLOPS
+expensive; the difference that remains is the GEMM itself, 13.6 TFLOPS
 against 14.2.
 
 llama.cpp ships a SASS-patched variant of its kernel that renames registers to
 remove the same-bank source pairs ptxas leaves behind. The headroom was measured
 before doing that work, with two ablations of `gemm_f16` on the gate shape (both
-compute nonsense, only the timing counts):
+compute nonsense, only the timing counts), against a real kernel that measured
+12.0 TFLOPS at the time and 13.6 after the later barrier removal:
 
-| variant | TFLOPS |
+| variant (pre-barrier kernel) | TFLOPS |
 |---|---:|
 | real kernel | 12.0 |
 | LDS reads from a fixed address (no bank spread) | 12.6 |
@@ -295,7 +300,7 @@ registers necessarily span all four banks) does not translate into stalls: with
 two warps per scheduler they overlap. A SASS renaming pass would need an
 assembler (CuAssembler) that is not installable on this machine, so it is not
 where the next 10% lives. What is left is issue efficiency with eight warps and
-216 registers per thread: one block per SM, and no tile shape measured (64×128
+222 registers per thread: one block per SM, and no tile shape measured (64×128
 with 8×4, 128×128 with 4×8) does better than 1%.
 
 ## 3. Attention
@@ -310,16 +315,16 @@ partial `(m, l, acc)`. A second kernel combines the splits. Without the GQA fold
 the KV re-reads alone are ~7× the unique traffic, which is fatal at long
 context.
 
-At the time of writing, `attn_splits = 12` is best for both a 256-token and a
-512-token benchmark: 4 leaves SMs idle, 32 gives each block too few positions to
-amortise the combine.
+`attn_splits` is flat between 8 and 32 on the 512-token benchmark
+(73.3–73.8 tok/s); 4 leaves SMs idle and loses ~3%. The tuner's current pick
+for this model is 8, resolved on prefill.
 
 **Prefill** (`attn_prefill`). One block per query head, one warp per query,
 KV tiles of 32 positions staged in shared memory, causal mask per query, same
 online softmax. 8 queries per block.
 
 Both are verified against a CPU reference (see `crates/p100/tests/kernels.rs`):
-prefill to 3e-6, decode to 2e-6 relative error, for 1/4/16 splits and four
+prefill to 3e-6, decode to 2e-6 relative error, for 1/4/16/32 splits and four
 causal configurations.
 
 ## 4. Multi-GPU
@@ -331,8 +336,9 @@ engine uses **layer split**: layer `l` lives on device `l·ndev/nlayer`, each
 device keeps its own layers' KV cache, and the only cross-device traffic is the
 residual row (14 KiB) at each boundary, staged through pinned host memory.
 
-Verified: the same prompt on one and two GPUs produces coherent text; a single
-stream gets no speedup (there is nothing to pipeline), which is expected.
+Verified: the same prompt on one and two GPUs produces coherent text. A single
+stream gets no meaningful speedup — 832 tok/s prefill / 74.7 decode on two cards
+against 823 / 73.8 on one — because there is nothing to pipeline.
 
 ## 5. Numerical error budget
 
@@ -344,14 +350,13 @@ stream gets no speedup (there is nothing to pipeline), which is expected.
 | q6_k GEMM vs CPU dot | 6e-5 |
 | prefill attention vs CPU | 3e-6 |
 | decode attention vs CPU | 2e-6 |
-| batched prefill vs token-at-a-time decoding | same argmax, 0.1-0.2 % logit RMS spread |
+| batched prefill vs token-at-a-time decoding | same argmax, 0.05-0.1 % logit RMS spread |
 | end-to-end output | coherent on all prompts tried |
 
 The batched-vs-streaming spread is fp16 KV rounding and the GEMM's different
-reduction order, amplified over 28 layers, not a layout bug; it grows from 0.1%
-to 0.2% once a 512-token tile runs the whole prompt through the fp16 GEMM in one
-pass. `self-test` with
-the 8-column GEMV on both sides measures the same 0.1 %.
+reduction order, amplified over 28 layers, not a layout bug; it grows from
+0.05% to 0.1% once a tile longer than 24 tokens runs the fp16 GEMM instead of
+the 8-column GEMV.
 
 ## 6. Validation against llama.cpp
 
@@ -361,22 +366,21 @@ same 512-token chunks, same weights, measured on this checkout:
 
 | check | llama.cpp | trav-p100 |
 |---|---:|---:|
-| 4 x 512-token chunks of `README.md` + `docs/DESIGN.md` | 10.0483 | 10.0461 |
-| token ids for the 5842-token corpus | 5842 | 5842 (last token is a trailing EOS in `llama-tokenize`) |
+| 4 x 512-token chunks of `README.md` + `docs/DESIGN.md` | 11.9095 | 11.9101 |
+| token ids for the 11k-token corpus | equal | equal (last token is a trailing EOS in `llama-tokenize`) |
 
 The scoring window matters more than any kernel detail. `llama-perplexity`
 requests logits from position `n_ctx/2` and scores `n_ctx/2 - 1` targets per
 chunk (257..511 of a 512-token window); the first half is context only.
 `trav-p100 perplexity` now defaults to the same convention (`--ppl-skip`
-defaults to `ctx/2 + 1`). Decoding llama's own saved logits with that window
-gives per-chunk PPL `[10.2473, 22.3148, 3.6827, 12.1068]`; trav-p100 measures
-`[10.2365, 22.3137, 3.6849, 12.1018]`, a 0.02% difference over 1020 scored
-tokens.
+defaults to `ctx/2 + 1`). On the current docs the two engines score 11.9095 and
+11.9101 over 1020 scored tokens, a 0.01% difference; trav-p100's per-chunk
+values are `[11.3502, 17.0166, 14.4477, 7.2108]`.
 
-Scoring all 511 positions instead (`--ppl-skip 0`) gives 14.51: the 256-token
+Scoring all 511 positions instead (`--ppl-skip 0`) gives 15.96: the 256-token
 cold start is included, so that number is not comparable to `llama-perplexity`.
 Comparing the two conventions produced a false "44% accuracy gap" during this
-work; the like-for-like number is the 0.02% above.
+work; the like-for-like number is the 0.01% above.
 
 The first version of this engine was missing the `head_dim^-0.5` scaling of
 `q @ k^T`. Output was still fluent and answers to easy questions were correct,
@@ -397,5 +401,5 @@ The `gemv_bandwidth`, `gemm_throughput`, `hfma2_peak`, `dequant_f16_matches_gguf
 and `gemm_f16_matches_dense` tests print the achieved GB/s, TFLOPS, the pure-HFMA2
 ceiling and the fp16 prefill path's accuracy, so a regression in the memory or
 issue paths is obvious without running the model. `self-test` must report the
-same argmax and a 0.1% logit spread; run it on a prompt longer than 24 tokens
-to exercise the GEMM path.
+same argmax and at most a 0.1% logit spread; run it on a prompt longer than 24
+tokens to exercise the GEMM path.

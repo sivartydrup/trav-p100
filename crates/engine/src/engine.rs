@@ -21,6 +21,12 @@ use crate::sampler::{sample, SamplingParams};
 /// matrix is read and dequantised once per prompt instead of once per tile.
 pub const MAX_PREFILL_COLS: usize = 512;
 
+/// Largest flash-decoding split count the launcher accepts. The split buffers
+/// are sized for this rather than for the profile's value, because the tuner
+/// rewrites `attn_splits` on a live engine (`tune` sweeps it before writing the
+/// profile).
+pub const MAX_ATTN_SPLITS: usize = 64;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Tuning {
@@ -150,14 +156,16 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn alloc(m: &Model, d: usize, tc: usize, tuning: &Tuning) -> Result<Scratch> {
+    fn alloc(m: &Model, d: usize, tc: usize) -> Result<Scratch> {
         let hp = &m.hp;
         let dev = &m.devices[d];
         let k = hp.n_embd;
         let ff = hp.n_ff;
         let hd = hp.head_dim;
         let nkvd = hp.n_head_kv * hd;
-        let ns = tuning.attn_splits;
+        // Sized for the launcher's ceiling, not the current profile: `tune`
+        // mutates `attn_splits` on a constructed engine.
+        let ns = MAX_ATTN_SPLITS;
         let inv: Vec<f32> = (0..hd / 2)
             .map(|i| 1.0 / hp.rope_theta.powf(2.0 * i as f32 / hd as f32))
             .collect();
@@ -221,9 +229,10 @@ fn f16_ws_bytes(hp: &crate::model::HParams) -> usize {
 impl Engine {
     pub fn new(model_path: &str, gpus: &[usize], tuning: Tuning) -> Result<Engine> {
         let model = crate::model::load(model_path, gpus)?;
-        // Buffers are sized for the widest prefill tile (128 columns) so the
-        // tuner can widen the tile after construction; a short tail tile runs
-        // the smaller GEMV instantiations against the same buffers.
+        // Buffers are sized for the widest prefill tile (`MAX_PREFILL_COLS`) and
+        // the largest split count (`MAX_ATTN_SPLITS`) so the tuner can widen
+        // either knob after construction; a short tail tile runs the smaller
+        // GEMV instantiations against the same buffers.
         let tc = MAX_PREFILL_COLS;
         let hp = &model.hp;
         let nkvd = hp.n_head_kv * hp.head_dim;
@@ -245,7 +254,7 @@ impl Engine {
 
         let mut scratch = Vec::new();
         for d in 0..model.devices.len() {
-            scratch.push(Scratch::alloc(&model, d, tc, &tuning)?);
+            scratch.push(Scratch::alloc(&model, d, tc)?);
         }
         let stage = model.devices[0].pinned(tc * hp.n_embd * 4)?;
         let logits_host = model.devices[model.out_dev].pinned(hp.vocab * 4)?;
@@ -657,7 +666,7 @@ fn run_tile(
             // The split count is fixed so the decode step can be captured; a
             // split whose range is empty writes l = 0 and drops out in the
             // combine. The cache length itself is read from `ctl`.
-            let ns = tuning.attn_splits.clamp(1, 64);
+            let ns = tuning.attn_splits.clamp(1, MAX_ATTN_SPLITS);
             kf.attn_decode(
                 dev, &kv.k[l], &kv.v[l], &sc.q, &sc.attn, &sc.pm, &sc.pl, &sc.pacc, hp.n_head, nkv,
                 hd, &sc.ctl, ns, qpk, stream,
