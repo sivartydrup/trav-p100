@@ -28,7 +28,12 @@ enum Cmd {
     /// List the CUDA devices this build can use.
     Info,
     /// Dump GGUF metadata, tensor types and sizes.
-    Inspect { model: String },
+    Inspect {
+        model: String,
+        /// Print every metadata key (used to check rope scaling / norms).
+        #[arg(long)]
+        meta: bool,
+    },
     /// Run one prompt to completion.
     Run(RunArgs),
     /// Interactive chat (ChatML/Qwen template).
@@ -117,7 +122,11 @@ struct SampleArgs {
 impl SampleArgs {
     fn params(&self) -> SamplingParams {
         SamplingParams {
-            temperature: if self.greedy != 0 { 0.0 } else { self.temperature },
+            temperature: if self.greedy != 0 {
+                0.0
+            } else {
+                self.temperature
+            },
             top_p: self.top_p,
             top_k: self.top_k,
             min_p: self.min_p,
@@ -179,7 +188,10 @@ struct BenchArgs {
 struct SelfTestArgs {
     #[command(flatten)]
     m: ModelArgs,
-    #[arg(long, default_value = "The quick brown fox jumps over the lazy dog, and then it")]
+    #[arg(
+        long,
+        default_value = "The quick brown fox jumps over the lazy dog, and then it"
+    )]
     prompt: String,
 }
 
@@ -192,6 +204,11 @@ struct PerplexityArgs {
     /// Chunks of `ctx` tokens to score.
     #[arg(long, default_value_t = 4)]
     chunks: usize,
+    /// Leading tokens of each chunk used as context but not scored.
+    /// Defaults to `ctx/2 + 1`, which is what llama-perplexity scores (the
+    /// first half of the window is context only). Use 0 for all positions.
+    #[arg(long)]
+    ppl_skip: Option<usize>,
 }
 
 #[derive(Args)]
@@ -222,7 +239,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Info => info(),
-        Cmd::Inspect { model } => inspect(&model),
+        Cmd::Inspect { model, meta } => inspect(&model, meta),
         Cmd::Run(a) => run(a),
         Cmd::Chat(a) => chat(a),
         Cmd::Bench(a) => bench(a),
@@ -244,7 +261,10 @@ fn main() -> Result<()> {
 
 fn info() -> Result<()> {
     let n = trav_p100::Device::count()?;
-    println!("{n} CUDA device(s), kernels built for {}", trav_p100::arch_string());
+    println!(
+        "{n} CUDA device(s), kernels built for {}",
+        trav_p100::arch_string()
+    );
     for i in 0..n {
         let d = trav_p100::Device::open(i)?;
         let (free, total) = d.mem_info()?;
@@ -263,15 +283,25 @@ fn info() -> Result<()> {
             let p = trav_p100::Device::open(0)?;
             println!(
                 "      peer access from GPU 0: {}",
-                if p.can_access_peer(&d) { "yes" } else { "no (host bridge)" }
+                if p.can_access_peer(&d) {
+                    "yes"
+                } else {
+                    "no (host bridge)"
+                }
             );
         }
     }
     Ok(())
 }
 
-fn inspect(path: &str) -> Result<()> {
+fn inspect(path: &str, meta: bool) -> Result<()> {
     let g = trav_gguf::Gguf::open(path)?;
+    if meta {
+        for (k, v) in &g.meta {
+            println!("{k} = {}", fmt_meta(v));
+        }
+        return Ok(());
+    }
     println!("file      {}", g.path.display());
     println!("arch      {} ({})", g.architecture(), g.name());
     println!("alignment {}", g.alignment);
@@ -290,8 +320,24 @@ fn inspect(path: &str) -> Result<()> {
     for (k, (c, b)) in hist {
         println!("{k:<8} {c:>6} {:>10}", fmt_bytes(b));
     }
-    println!("\ntotal   weights {}", fmt_bytes(trav_engine::model::HParams::weight_bytes(&g)));
+    println!(
+        "\ntotal   weights {}",
+        fmt_bytes(trav_engine::model::HParams::weight_bytes(&g))
+    );
     Ok(())
+}
+
+fn fmt_meta(v: &trav_gguf::Value) -> String {
+    use trav_gguf::Value;
+    match v {
+        Value::String(s) if s.len() > 120 => format!("{s:?}..."),
+        Value::String(s) => format!("{s:?}"),
+        Value::Array(a) if a.len() > 8 => {
+            format!("[{} items; first {:?}]", a.len(), &a[..4])
+        }
+        Value::Array(a) => format!("{a:?}"),
+        other => format!("{other:?}"),
+    }
 }
 
 fn fmt_bytes(b: usize) -> String {
@@ -304,12 +350,12 @@ fn fmt_bytes(b: usize) -> String {
 
 /// Prefill `ids` in tiles, returning the last-token logits and the elapsed time.
 fn prefill(eng: &mut Engine, seq: &mut Seq, ids: &[u32]) -> Result<(Vec<f32>, f64)> {
-    let cols = eng.tuning.prefill_cols.clamp(1, 8);
+    let cols = eng.tuning.prefill_cols.clamp(1, 512);
     let t0 = Instant::now();
     let mut logits = Vec::new();
     let mut i = 0;
     while i < ids.len() {
-        let n = (ids.len() - i).min(cols);
+        let n = trav_engine::engine::prefill_tile(cols, ids.len() - i);
         let last = i + n == ids.len();
         logits = eng.step(seq, &ids[i..i + n], last)?;
         i += n;
@@ -327,9 +373,11 @@ fn run(a: RunArgs) -> Result<()> {
     let tok_ids = if a.raw {
         eng.model.tokenizer.encode(&a.prompt)
     } else {
-        eng.model
-            .tokenizer
-            .render_chat(a.system.as_deref(), &[(Role::User, a.prompt.clone())], true)
+        eng.model.tokenizer.render_chat(
+            a.system.as_deref(),
+            &[(Role::User, a.prompt.clone())],
+            true,
+        )
     };
     let mut seq = eng.new_seq(tuning.ctx, a.s.params())?;
     let (mut logits, secs) = prefill(&mut eng, &mut seq, &tok_ids)?;
@@ -432,7 +480,10 @@ fn chat(a: ChatArgs) -> Result<()> {
         print!("{tail}");
         reply.push_str(&tail);
         let el = t0.elapsed().as_secs_f64();
-        eprintln!("\n[{n} tokens, {:.2} tok/s]", (n.saturating_sub(1)) as f64 / el);
+        eprintln!(
+            "\n[{n} tokens, {:.2} tok/s]",
+            (n.saturating_sub(1)) as f64 / el
+        );
         turns.push((Role::Assistant, reply));
     }
 }
@@ -448,7 +499,17 @@ fn perplexity(a: PerplexityArgs) -> Result<()> {
     }
     let chunks = a.chunks.min(ids.len() / ctx);
     let vocab = eng.model.hp.vocab;
-    let cols = tuning.prefill_cols.clamp(1, 8);
+    let cols = tuning.prefill_cols.clamp(1, 512);
+    let skip = a.ppl_skip.unwrap_or(ctx / 2 + 1).min(ctx.saturating_sub(1));
+    println!(
+        "scoring tokens {skip}..{} of each {ctx}-token chunk{}",
+        ctx - 1,
+        if skip == 0 {
+            ""
+        } else {
+            " (llama-perplexity convention)"
+        }
+    );
     let mut ppls = Vec::new();
     for c in 0..chunks {
         let chunk = &ids[c * ctx..(c + 1) * ctx];
@@ -457,11 +518,11 @@ fn perplexity(a: PerplexityArgs) -> Result<()> {
         let mut n = 0usize;
         let mut i = 0;
         while i < chunk.len() {
-            let tc = (chunk.len() - i).min(cols);
+            let tc = trav_engine::engine::prefill_tile(cols, chunk.len() - i);
             let logits = eng.step_all_logits(&mut seq, &chunk[i..i + tc])?;
             for j in 0..tc {
                 let target = i + j + 1;
-                if target >= chunk.len() {
+                if target >= chunk.len() || target < skip {
                     continue;
                 }
                 let row = &logits[j * vocab..(j + 1) * vocab];
@@ -525,10 +586,22 @@ fn selftest(a: SelfTestArgs) -> Result<()> {
     }
     eprintln!("prompt: {} tokens", ids.len());
 
-    let mut seq = eng.new_seq(tuning.ctx, SamplingParams { temperature: 0.0, ..Default::default() })?;
+    let mut seq = eng.new_seq(
+        tuning.ctx,
+        SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        },
+    )?;
     let (batched, pp_s) = prefill(&mut eng, &mut seq, &ids)?;
 
-    let mut seq2 = eng.new_seq(tuning.ctx, SamplingParams { temperature: 0.0, ..Default::default() })?;
+    let mut seq2 = eng.new_seq(
+        tuning.ctx,
+        SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        },
+    )?;
     let mut single = Vec::new();
     let t0 = Instant::now();
     for (i, &t) in ids.iter().enumerate() {
@@ -558,8 +631,13 @@ fn selftest(a: SelfTestArgs) -> Result<()> {
                 if layer_diff <= 3 {
                     let pos = i / nkvd;
                     let rem = i - pos * nkvd;
-                    eprintln!("    l{l} pos{pos} head{} d{}: {} vs {}",
-                              rem / eng.model.hp.head_dim, rem % eng.model.hp.head_dim, x, y);
+                    eprintln!(
+                        "    l{l} pos{pos} head{} d{}: {} vs {}",
+                        rem / eng.model.hp.head_dim,
+                        rem % eng.model.hp.head_dim,
+                        x,
+                        y
+                    );
                 }
             }
         }
@@ -582,15 +660,30 @@ fn selftest(a: SelfTestArgs) -> Result<()> {
         sum_sq += (d as f64) * (d as f64);
     }
     let rms = (sum_sq / n as f64).sqrt();
-    let scale = batched.iter().cloned().fold(f32::MIN, f32::max).abs().max(1.0);
+    let scale = batched
+        .iter()
+        .cloned()
+        .fold(f32::MIN, f32::max)
+        .abs()
+        .max(1.0);
 
     let top = |v: &[f32]| -> Vec<(u32, f32)> {
-        let mut idx: Vec<(f32, u32)> = v.iter().cloned().enumerate().map(|(i, x)| (x, i as u32)).collect();
+        let mut idx: Vec<(f32, u32)> = v
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, x)| (x, i as u32))
+            .collect();
         idx.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
         idx.truncate(5);
         idx.into_iter().map(|(x, i)| (i, x)).collect()
     };
-    println!("prefill {:.1} ms ({:.0} tok/s), one-at-a-time {:.1} ms", pp_s * 1e3, ids.len() as f64 / pp_s, per_s * 1e3);
+    println!(
+        "prefill {:.1} ms ({:.0} tok/s), one-at-a-time {:.1} ms",
+        pp_s * 1e3,
+        ids.len() as f64 / pp_s,
+        per_s * 1e3
+    );
     println!("logit max |diff| {max_abs:.5e} at {max_i}, rms {rms:.3e}, |max logit| {scale:.1}");
     println!("batched top5: {:?}", top(&batched));
     println!("single  top5: {:?}", top(&single));
@@ -614,7 +707,10 @@ fn selftest(a: SelfTestArgs) -> Result<()> {
     if rms / scale as f64 > 0.25 {
         bail!("logit spread {rms:.3} is large relative to the scale {scale:.1}");
     }
-    println!("OK: same argmax (token {t1}), spread {:.1}% of logit scale", 100.0 * rms / scale as f64);
+    println!(
+        "OK: same argmax (token {t1}), spread {:.1}% of logit scale",
+        100.0 * rms / scale as f64
+    );
     Ok(())
 }
 
@@ -631,7 +727,12 @@ fn bench_prompt(eng: &Engine, n: usize) -> Vec<u32> {
     ids
 }
 
-fn measure(eng: &mut Engine, ids: &[u32], n_predict: usize, greedy: bool) -> Result<(f64, f64, usize)> {
+fn measure(
+    eng: &mut Engine,
+    ids: &[u32],
+    n_predict: usize,
+    greedy: bool,
+) -> Result<(f64, f64, usize)> {
     let mut params = SamplingParams::default();
     if greedy {
         params.temperature = 0.0;
@@ -686,7 +787,7 @@ fn tune(a: TuneArgs) -> Result<()> {
     let mut best = (tuning.attn_splits, tuning.prefill_cols, 0f64, 0f64);
     println!("splits  prefill_cols      pp tok/s    tg tok/s");
     for &splits in &[4usize, 8, 12, 16, 24, 32] {
-        for &cols in &[4usize, 8] {
+        for &cols in &[8usize, 64, 128, 256, 512] {
             eng.tuning.attn_splits = splits;
             eng.tuning.prefill_cols = cols;
             let mut pp_best = 0f64;

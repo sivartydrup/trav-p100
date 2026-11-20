@@ -28,22 +28,28 @@ on this machine (upstream `b10660` + the GP100 patch set).
 
 | engine | prefill (pp512) | decode (tg128) | perplexity |
 |---|---:|---:|---:|
-| llama.cpp, P100-patched | 781 tok/s | 66.5 tok/s | 15.762 |
-| **trav-p100** | **180 tok/s** | **65.1 tok/s** | **15.783** |
+| llama.cpp, P100-patched (`bbad6fcfb`) | 831.7 tok/s | 81.4 tok/s | 13.2092 |
+| **trav-p100** | **762 tok/s** | **71.9 tok/s** | **13.2160** |
 
-The perplexity column is the same 512-token-chunk evaluation of the same file
-(`llama-perplexity -c 512` vs `trav-p100 perplexity --ctx 512`). A 0.13%
-difference is what two correct implementations of the same arithmetic produce
-under different reduction orders; it is the check that matters most, because
-it catches bugs that still generate fluent text.
+Both rows are measurements from this machine on one P100: `llama-bench -p 512
+-n 128` and `llama-perplexity -c 512 --chunks 4` from the fork in
+`../kmic-p100/build-p100`, and `bench` / `perplexity` from this checkout, same
+model file, same 4 × 512-token corpus (the repository's `README.md` +
+`docs/DESIGN.md`, so the absolute perplexity moves when the docs change — what
+matters is that the two engines agree to **0.05%**, 13.2160 against 13.2092,
+over 1020 scored tokens). Perplexity uses `llama-perplexity`'s convention: each
+512-token chunk keeps its first 257 tokens as context and scores the last 255.
 
-Decode is at parity; prefill is the known weak spot (see
-[Limitations](#limitations)). Two effects matter for decode: the engine streams
-**423 GB/s** from HBM in the single-column GEMV (71% of this card's measured
-594 GB/s ceiling), and the lm_head + attention + launch overhead add ~4 ms on
-top of the ~10.5 ms of weight traffic.
+Prefill is 92% of llama.cpp (it was 1.6x slower before the fp16 prefill path
+described below); decode is 88%. Decode is bandwidth bound and sits where the
+GEMV does: the projections stream at 320-400 GB/s against the card's measured
+594 GB/s streaming ceiling, which is 10.5 ms of the 13.6 ms of kernels a token
+costs; attention, norm and activation-prep add 1.3 ms. The decode step is 97%
+GPU-busy — 0.4 ms per token is spent between kernels — and running it as a
+CUDA graph (captured once per sequence, replayed for the rest) removes the host
+submission cost for +0.3%.
 
-Two P100s with layer split, same model: 69.2 tok/s decode, 180 tok/s prefill.
+Two P100s with layer split, same model: 763 tok/s prefill, 71.8 tok/s decode.
 Layer split does not help a single stream (there is no pipelining across
 requests yet) — it is there so that a model that does not fit on one card still
 runs, which is the 27B case.
@@ -56,9 +62,18 @@ runs, which is the 27B case.
 * **Qwen2/3 byte-level BPE** tokenizer built straight from the GGUF vocab
   (llama.cpp's `qwen2` pre-tokeniser regex, including the look-ahead) and the
   ChatML template that ships inside the model.
-* Batched prefill (8 columns per GEMV), split-KV flash decoding, online
-  softmax, fp16 KV cache.
+* **Whole-prompt prefill tiles** (up to 512 columns), so each weight matrix is
+  touched once per prompt: large matrices are dequantised once into an fp16
+  scratch and run through a 128×128, 8×8-register-tile fp16 GEMM with
+  double-buffered 32-value stages; the 512-row k/v projections and short tails
+  use the fused dequantise+GEMM (64-value stages, 8×4 register tile) with
+  split-K across `blockIdx.z` when the row count cannot fill the card. Split-KV
+  flash decoding, online softmax, fp16 KV cache.
 * **Layer-split across any number of P100s**, chosen with `--gpus 0,1`.
+* **Decode step as a CUDA graph**: captured once per sequence on a dedicated
+  stream and replayed, with the per-token scalars (KV write position, attention
+  length) read from device memory so the graph is position independent. Set
+  `TRAV_NO_GRAPH=1` to run the same kernels as plain launches.
 * Sampling: temperature, top-k, top-p, min-p, repetition penalty, seeds.
 * OpenAI-compatible HTTP API with SSE streaming.
 * A **tuner** that sweeps the runtime knobs and writes a per-model TOML profile.
@@ -111,13 +126,14 @@ The tuner measures prefill and decode for each candidate and writes the winner:
 
 ```toml
 ctx = 8192
-prefill_cols = 8   # tokens per prefill tile = columns of the fused GEMV
-attn_splits = 12   # flash-decoding KV splits (SM coverage vs combine cost)
+prefill_cols = 512  # tokens per prefill tile; the prompt is one tile at 512
+attn_splits = 24   # flash-decoding KV splits (SM coverage vs combine cost)
 ```
 
-`prefill_cols = 8` is worth ~1.7× over `4` on this card; `attn_splits` above 16
-starts to hurt because each split gets too few positions to amortise the
-cross-split combine.
+`prefill_cols = 32` is worth 1.8× over 8 on this card; tiles of 9..23 tokens
+are cheaper on the 8-column GEMV, so the driver only uses the GEMM for tails of
+24 or more. `attn_splits` above ~24 starts to hurt because each split gets too
+few positions to amortise the cross-split combine.
 
 ## Verification
 
@@ -130,16 +146,23 @@ cargo test -p trav-p100            # kernels vs the GGUF reference dequantiser
 
 * `cargo test -p trav-p100` compares every GEMV instantiation (q4_k / q6_k ×
   1/2/4/8 columns, including the two-rows-per-warp variant) against a CPU
-  dequantise-and-dot, and does the same for prefill attention (four causal
-  configurations), split-KV decode attention (1/4/16 splits) and RoPE + KV
-  write.
+  dequantise-and-dot, and does the same for the fused GEMM (q4_k / q6_k,
+  32/7-column tails), the token-embedding rows, prefill attention (1/4/8/13/32
+  queries, four causal configurations), split-KV decode attention (1/4/16
+  splits) and RoPE + KV write. `hfma2_peak` and the bandwidth tests print the
+  card's issue-rate and memory ceilings so a regression is visible without a
+  model.
 * `self-test` runs the same prompt through the batched prefill path and through
   token-at-a-time decoding, then compares the logits. They must pick the same
-  argmax; the residual spread is fp16 KV rounding (≈4% of the logit scale).
-* `perplexity` on a text file is checked against `llama-perplexity` on the same
-  file: 15.783 vs 15.762 (0.13%) on `README.md + docs/DESIGN.md` at `--ctx 512`,
-  and 1.228 vs 1.005 on a highly repetitive corpus. `tokenize` prints ids that
-  can be diffed against `llama-tokenize`.
+  argmax; the measured spread is 0.1% of the logit scale for the GEMM path
+  after 13- and 40-token prompts.
+* `perplexity` and `tokenize` are the cross-engine checks. Token ids match
+  `llama-tokenize` for the 5842-token markdown corpus (the last token differs
+  because llama-tokenize appends an EOS). On the first four 512-token chunks of
+  `README.md + docs/DESIGN.md`, `perplexity` scores 10.0461 against
+  `llama-perplexity`'s 10.0483 — 0.02% over 1020 scored tokens. Both tools keep
+  the first 257 tokens of each window as context and score the last 255;
+  `--ppl-skip 0` scores the whole window and is not comparable.
 * `bench` doubles as a smoke test that the numbers are where the design says
   they should be.
 
@@ -148,8 +171,8 @@ cargo test -p trav-p100            # kernels vs the GGUF reference dequantiser
 ```mermaid
 flowchart LR
   A[tokens] --> B[embed q4_k] --> C[rmsnorm]
-  C --> D[prep_act<br/>f32 → f16, per-32-block scale + 16-value sums]
-  D --> E[fused dequant GEMV q/k/v<br/>HFMA2 on subnormal half]
+  C --> D[prep_act / prep_act_col<br/>f32 → f16, power-of-two scale]
+  D --> E[fused dequant GEMV/GEMM q/k/v<br/>HFMA2, tile per 32 tokens]
   E --> F[RoPE] --> G[KV cache f16]
   G --> H{one token?}
   H -- yes --> I[split-KV flash decode]
@@ -161,7 +184,7 @@ flowchart LR
   O --> P[residual] --> Q[lm_head q6_k] --> R[sampler]
 ```
 
-Four decisions carry most of the performance:
+Five decisions carry most of the performance:
 
 1. **Dequantise into subnormal halves.** A 4-bit value `q` maps exactly onto the
    fp16 subnormal bit pattern `q * 2^-24`, so one `PRMT` turns two nibbles into
@@ -180,17 +203,29 @@ Four decisions carry most of the performance:
    Staging eight super-blocks at a time was worth 1.84× on the decode kernel
    (126 → 231 GB/s), and vectorising the staging loads another 1.67×
    (231 → 385 GB/s).
-4. **Layer split for multiple GPUs.** PCIe P100s have no NVLink, so a per-layer
+4. **One dequantise per 32 tokens in prefill.** The subnormal trick needs a
+   2^24 scale that does not fit fp16, so the fused GEMM writes the real
+   `dsc·q - dm` half into shared memory instead (two exact power-of-two steps),
+   then accumulates a whole 128-k stage in fp16 and meets fp32 once. A 64×32
+   block with 16-byte `uint4` fragments needs two shared loads per sixteen
+   `HFMA2`. It is 2.3× per token over the 8-column GEMV and is now issue-bound,
+   not bandwidth-bound.
+5. **Layer split for multiple GPUs.** PCIe P100s have no NVLink, so a per-layer
    all-reduce would dominate. Each device owns a contiguous layer range and only
    the residual row (14 KiB) crosses the bus between ranges.
 
 ## Limitations
 
-* **Prefill is 4× slower than llama.cpp** (183 vs 781 tok/s). The multi-column
-  GEMV re-reads the weight stream once per 8 tokens and its activation staging
-  is not amortised enough; a fused dequantise + tiled GEMM (weights dequantised
-  into shared memory once, reused across a 32-token tile) is the fix and is the
-  next piece of work. Decode does not depend on it.
+* **Prefill is 1.7× slower than llama.cpp** (487 vs 830 tok/s). The fused GEMM
+  fixed the weight re-read (once per 32 tokens instead of 8) and moved prefill
+  from 2.6 to 7.4 TFLOPS on the 16384x18944 shape; split-K then recovered the
+  wave-quantisation loss on short-row projections (56 blocks against 112
+  resident slots ran at 50% SM occupancy). Ablating the stage input measures
+  the split: compute loop 2.00 ms, dequantise 0.33 ms, activation staging
+  0.07 ms per 2.70 ms run. The compute loop sits at ~76% of the 17.0 TFLOPS
+  HFMA2 issue peak with 8 warps/SM, so the remaining work is latency hiding
+  (more warps needs less shared memory per block) and the dequantise overlap.
+  Decode does not depend on it.
 * Only `qwen2` / `qwen3` and only `q4_k` / `q6_k` weights. Other architectures or
   quant types fail loudly at load time rather than producing wrong output.
 * One request at a time. The column tile is a prefill tile, not a continuous

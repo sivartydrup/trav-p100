@@ -15,6 +15,8 @@ pub type CUmodule = *mut c_void;
 pub type CUfunction = *mut c_void;
 pub type CUstream = *mut c_void;
 pub type CUevent = *mut c_void;
+pub type CUgraph = *mut c_void;
+pub type CUgraphExec = *mut c_void;
 
 pub const CUDA_SUCCESS: CUresult = 0;
 pub const CUDA_ERROR_NOT_FOUND: CUresult = 500;
@@ -23,6 +25,12 @@ pub const CUDA_ERROR_OUT_OF_MEMORY: CUresult = 2;
 pub const CUDA_ERROR_NOT_INITIALIZED: CUresult = 3;
 pub const CUDA_ERROR_INVALID_CONTEXT: CUresult = 201;
 pub const CUDA_ERROR_LAUNCH_FAILED: CUresult = 719;
+pub const CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED: CUresult = 900;
+pub const CUDA_ERROR_STREAM_CAPTURE_INVALIDATED: CUresult = 901;
+
+// cuStreamBeginCapture modes.
+pub const CU_STREAM_CAPTURE_MODE_GLOBAL: u32 = 0;
+pub const CU_STREAM_CAPTURE_MODE_THREAD_LOCAL: u32 = 1;
 
 // Device attributes used by the engine.
 pub const ATTR_MAX_THREADS_PER_BLOCK: c_int = 1;
@@ -114,18 +122,29 @@ type FnMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> CUresult;
 type FnMemcpyHtoD = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult;
 type FnMemcpyDtoH = unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult;
 type FnMemcpyDtoD = unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult;
-type FnMemcpyHtoDAsync = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult;
-type FnMemcpyDtoHAsync = unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult;
-type FnMemcpyDtoDAsync = unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize, CUstream) -> CUresult;
-type FnMemcpyPeerAsync =
-    unsafe extern "C" fn(CUdeviceptr, CUcontext, CUdeviceptr, CUcontext, usize, CUstream) -> CUresult;
+type FnMemcpyHtoDAsync =
+    unsafe extern "C" fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult;
+type FnMemcpyDtoHAsync =
+    unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult;
+type FnMemcpyDtoDAsync =
+    unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize, CUstream) -> CUresult;
+type FnMemcpyPeerAsync = unsafe extern "C" fn(
+    CUdeviceptr,
+    CUcontext,
+    CUdeviceptr,
+    CUcontext,
+    usize,
+    CUstream,
+) -> CUresult;
 type FnMemsetD32 = unsafe extern "C" fn(CUdeviceptr, u32, usize) -> CUresult;
 type FnMemsetD8 = unsafe extern "C" fn(CUdeviceptr, u8, usize) -> CUresult;
 type FnModuleLoadData = unsafe extern "C" fn(*mut CUmodule, *const c_void) -> CUresult;
 type FnModuleUnload = unsafe extern "C" fn(CUmodule) -> CUresult;
-type FnModuleGetFunction = unsafe extern "C" fn(*mut CUfunction, CUmodule, *const c_char) -> CUresult;
+type FnModuleGetFunction =
+    unsafe extern "C" fn(*mut CUfunction, CUmodule, *const c_char) -> CUresult;
 type FnFuncSetAttribute = unsafe extern "C" fn(CUfunction, c_int, c_int) -> CUresult;
 type FnFuncGetAttribute = unsafe extern "C" fn(*mut c_int, c_int, CUfunction) -> CUresult;
+type FnOccupancy = unsafe extern "C" fn(*mut c_int, CUfunction, c_int, usize) -> CUresult;
 type FnLaunchKernel = unsafe extern "C" fn(
     CUfunction,
     u32,
@@ -147,6 +166,12 @@ type FnEventRecord = unsafe extern "C" fn(CUevent, CUstream) -> CUresult;
 type FnEventSynchronize = unsafe extern "C" fn(CUevent) -> CUresult;
 type FnEventElapsedTime = unsafe extern "C" fn(*mut f32, CUevent, CUevent) -> CUresult;
 type FnEventDestroy = unsafe extern "C" fn(CUevent) -> CUresult;
+type FnStreamBeginCapture = unsafe extern "C" fn(CUstream, u32) -> CUresult;
+type FnStreamEndCapture = unsafe extern "C" fn(CUstream, *mut CUgraph) -> CUresult;
+type FnGraphInstantiate = unsafe extern "C" fn(*mut CUgraphExec, CUgraph, u64) -> CUresult;
+type FnGraphLaunch = unsafe extern "C" fn(CUgraphExec, CUstream) -> CUresult;
+type FnGraphExecDestroy = unsafe extern "C" fn(CUgraphExec) -> CUresult;
+type FnGraphDestroy = unsafe extern "C" fn(CUgraph) -> CUresult;
 type FnDeviceCanAccessPeer = unsafe extern "C" fn(*mut c_int, CUdevice, CUdevice) -> CUresult;
 type FnCtxEnablePeerAccess = unsafe extern "C" fn(CUcontext, u32) -> CUresult;
 
@@ -187,10 +212,17 @@ pub struct Driver {
     pub module_get_function: FnModuleGetFunction,
     pub func_set_attribute: FnFuncSetAttribute,
     pub func_get_attribute: FnFuncGetAttribute,
+    pub occupancy_max_blocks: FnOccupancy,
     pub launch_kernel: FnLaunchKernel,
     pub stream_create: FnStreamCreate,
     pub stream_destroy: FnStreamDestroy,
     pub stream_synchronize: FnStreamSynchronize,
+    pub stream_begin_capture: FnStreamBeginCapture,
+    pub stream_end_capture: FnStreamEndCapture,
+    pub graph_instantiate: FnGraphInstantiate,
+    pub graph_launch: FnGraphLaunch,
+    pub graph_exec_destroy: FnGraphExecDestroy,
+    pub graph_destroy: FnGraphDestroy,
     pub event_create: FnEventCreate,
     pub event_record: FnEventRecord,
     pub event_synchronize: FnEventSynchronize,
@@ -269,10 +301,21 @@ impl Driver {
             module_get_function: sym!(lib, "cuModuleGetFunction", FnModuleGetFunction),
             func_set_attribute: sym!(lib, "cuFuncSetAttribute", FnFuncSetAttribute),
             func_get_attribute: sym!(lib, "cuFuncGetAttribute", FnFuncGetAttribute),
+            occupancy_max_blocks: sym!(
+                lib,
+                "cuOccupancyMaxActiveBlocksPerMultiprocessor",
+                FnOccupancy
+            ),
             launch_kernel: sym!(lib, "cuLaunchKernel", FnLaunchKernel),
             stream_create: sym!(lib, "cuStreamCreate", FnStreamCreate),
             stream_destroy: sym!(lib, "cuStreamDestroy_v2", FnStreamDestroy),
             stream_synchronize: sym!(lib, "cuStreamSynchronize", FnStreamSynchronize),
+        stream_begin_capture: sym!(lib, "cuStreamBeginCapture", FnStreamBeginCapture),
+        stream_end_capture: sym!(lib, "cuStreamEndCapture", FnStreamEndCapture),
+        graph_instantiate: sym!(lib, "cuGraphInstantiate", FnGraphInstantiate),
+        graph_launch: sym!(lib, "cuGraphLaunch", FnGraphLaunch),
+        graph_exec_destroy: sym!(lib, "cuGraphExecDestroy", FnGraphExecDestroy),
+        graph_destroy: sym!(lib, "cuGraphDestroy", FnGraphDestroy),
             event_create: sym!(lib, "cuEventCreate", FnEventCreate),
             event_record: sym!(lib, "cuEventRecord", FnEventRecord),
             event_synchronize: sym!(lib, "cuEventSynchronize", FnEventSynchronize),
@@ -304,12 +347,16 @@ impl Driver {
             name: if name.is_null() {
                 format!("CUDA_ERROR_{code}")
             } else {
-                unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned()
+                unsafe { CStr::from_ptr(name) }
+                    .to_string_lossy()
+                    .into_owned()
             },
             message: if msg.is_null() {
                 String::new()
             } else {
-                unsafe { CStr::from_ptr(msg) }.to_string_lossy().into_owned()
+                unsafe { CStr::from_ptr(msg) }
+                    .to_string_lossy()
+                    .into_owned()
             },
         }
     }

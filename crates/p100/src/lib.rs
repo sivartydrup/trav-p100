@@ -50,7 +50,11 @@ impl fmt::Debug for Device {
         write!(
             f,
             "Device({} {} cc={}.{} {}MiB)",
-            self.id, self.name, self.cc.0, self.cc.1, self.total_mem >> 20
+            self.id,
+            self.name,
+            self.cc.0,
+            self.cc.1,
+            self.total_mem >> 20
         )
     }
 }
@@ -191,12 +195,8 @@ impl Device {
     pub fn pinned(&self, bytes: usize) -> Result<PinnedBuf> {
         self.set_current();
         let mut ptr: *mut c_void = std::ptr::null_mut();
-        self.drv.check(unsafe {
-            (self.drv.mem_alloc_host)(
-                &mut ptr,
-                bytes,
-            )
-        })?;
+        self.drv
+            .check(unsafe { (self.drv.mem_alloc_host)(&mut ptr, bytes) })?;
         // cuMemAllocHost has no flags; use cuMemHostAlloc semantics via portable
         // allocation is unnecessary for a single process.
         let _ = CU_MEMHOSTALLOC_PORTABLE;
@@ -209,7 +209,9 @@ impl Device {
 
     pub fn can_access_peer(&self, peer: &Device) -> bool {
         let mut ok = 0;
-        let rc = unsafe { (self.drv.device_can_access_peer)(&mut ok, self.id as CUdevice, peer.id as CUdevice) };
+        let rc = unsafe {
+            (self.drv.device_can_access_peer)(&mut ok, self.id as CUdevice, peer.id as CUdevice)
+        };
         rc == CUDA_SUCCESS && ok == 1
     }
 
@@ -227,8 +229,9 @@ impl Device {
     pub fn module(&self, cubin: &[u8]) -> Result<Module> {
         self.set_current();
         let mut ptr: CUmodule = std::ptr::null_mut();
-        self.drv
-            .check(unsafe { (self.drv.module_load_data)(&mut ptr, cubin.as_ptr() as *const c_void) })?;
+        self.drv.check(unsafe {
+            (self.drv.module_load_data)(&mut ptr, cubin.as_ptr() as *const c_void)
+        })?;
         Ok(Module {
             ptr,
             ctx: self.ctx,
@@ -329,10 +332,83 @@ pub struct Stream {
     drv: &'static Driver,
 }
 
+// The context is current on the thread that owns the engine; the handle itself
+// is just a pointer, and the engine is used from one blocking task at a time.
+unsafe impl Send for Stream {}
+
 impl Stream {
     pub fn sync(&self) -> Result<()> {
         self.drv
             .check(unsafe { (self.drv.stream_synchronize)(self.ptr) })
+    }
+
+    /// Start recording every launch on this stream into a graph. Nothing runs
+    /// until the recorded graph is launched.
+    pub fn begin_capture(&self) -> Result<()> {
+        self.drv.check(unsafe {
+            (self.drv.stream_begin_capture)(self.ptr, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+        })
+    }
+
+    /// Stop recording and return the graph.
+    pub fn end_capture(&self) -> Result<Graph> {
+        let mut g: CUgraph = std::ptr::null_mut();
+        self.drv
+            .check(unsafe { (self.drv.stream_end_capture)(self.ptr, &mut g) })?;
+        Ok(Graph {
+            ptr: g,
+            ctx: self.ctx,
+            drv: self.drv,
+        })
+    }
+}
+
+pub struct Graph {
+    ptr: CUgraph,
+    ctx: CUcontext,
+    drv: &'static Driver,
+}
+
+impl Graph {
+    /// Turn the recorded graph into an executable one. Node arguments are
+    /// copied here, so every buffer the graph touches must keep its address and
+    /// every scalar it reads must be stable across launches.
+    pub fn instantiate(self) -> Result<GraphExec> {
+        let mut e: CUgraphExec = std::ptr::null_mut();
+        self.drv
+            .check(unsafe { (self.drv.graph_instantiate)(&mut e, self.ptr, 0) })?;
+        Ok(GraphExec {
+            ptr: e,
+            ctx: self.ctx,
+            drv: self.drv,
+        })
+    }
+}
+
+impl Drop for Graph {
+    fn drop(&mut self) {
+        unsafe { (self.drv.ctx_set_current)(self.ctx) };
+        let _ = unsafe { (self.drv.graph_destroy)(self.ptr) };
+    }
+}
+
+pub struct GraphExec {
+    ptr: CUgraphExec,
+    ctx: CUcontext,
+    drv: &'static Driver,
+}
+
+impl GraphExec {
+    pub fn launch(&self, stream: &Stream) -> Result<()> {
+        unsafe { (self.drv.ctx_set_current)(self.ctx) };
+        self.drv.check(unsafe { (self.drv.graph_launch)(self.ptr, stream.ptr) })
+    }
+}
+
+impl Drop for GraphExec {
+    fn drop(&mut self) {
+        unsafe { (self.drv.ctx_set_current)(self.ctx) };
+        let _ = unsafe { (self.drv.graph_exec_destroy)(self.ptr) };
     }
 }
 
@@ -442,6 +518,23 @@ impl Function {
         let rc = unsafe { (self.drv.func_get_attribute)(&mut v, 0, self.ptr) };
         (rc == CUDA_SUCCESS).then_some(v)
     }
+
+    /// Blocks of `block` threads / `smem` dynamic bytes that fit per SM.
+    pub fn occupancy_blocks(&self, block: i32, smem: usize) -> Option<i32> {
+        let mut v = 0;
+        unsafe { (self.drv.ctx_set_current)(self.ctx) };
+        let rc = unsafe { (self.drv.occupancy_max_blocks)(&mut v, self.ptr, block, smem) };
+        (rc == CUDA_SUCCESS).then_some(v)
+    }
+
+    /// Ask the driver for a shared-memory carveout (`CU_FUNC_ATTRIBUTE_
+    /// PREFERRED_SHARED_MEMORY_CARVEOUT`, percent of the 64 KiB unified cache).
+    /// The prefill GEMM needs two 29-31 KiB blocks resident per SM.
+    pub fn set_carveout(&self, percent: i32) -> Result<()> {
+        unsafe { (self.drv.ctx_set_current)(self.ctx) };
+        self.drv
+            .check(unsafe { (self.drv.func_set_attribute)(self.ptr, 9, percent) })
+    }
 }
 
 pub struct LaunchArgs {
@@ -450,7 +543,9 @@ pub struct LaunchArgs {
 
 impl LaunchArgs {
     pub fn new() -> Self {
-        LaunchArgs { storage: Vec::new() }
+        LaunchArgs {
+            storage: Vec::new(),
+        }
     }
 
     pub fn push<T: Copy>(&mut self, v: &mut T) -> &mut Self {
