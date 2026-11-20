@@ -182,6 +182,9 @@ struct BenchArgs {
     reps: usize,
     #[arg(long, default_value_t = 0)]
     greedy: u8,
+    /// Use 1.0 to benchmark greedy decoding without a repetition penalty.
+    #[arg(long, default_value_t = 1.05)]
+    repeat_penalty: f32,
 }
 
 #[derive(Args)]
@@ -380,7 +383,7 @@ fn run(a: RunArgs) -> Result<()> {
         )
     };
     let mut seq = eng.new_seq(tuning.ctx, a.s.params())?;
-    let (mut logits, secs) = prefill(&mut eng, &mut seq, &tok_ids)?;
+    let (logits, secs) = prefill(&mut eng, &mut seq, &tok_ids)?;
     eprintln!(
         "prefill {} tokens in {:.0} ms = {:.0} tok/s",
         tok_ids.len(),
@@ -393,8 +396,8 @@ fn run(a: RunArgs) -> Result<()> {
     let mut dec = trav_engine::tokenizer::StreamDecoder::default();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    let mut next = seq.sample(&logits);
     while n < a.max_new {
-        let next = seq.sample(&logits);
         if seq.stop.contains(&next) {
             break;
         }
@@ -409,7 +412,7 @@ fn run(a: RunArgs) -> Result<()> {
         if seq.n_past + 1 > seq.kv.cap {
             break;
         }
-        logits = eng.step(&mut seq, &[next], true)?;
+        next = eng.step_sample(&mut seq, &[next])?;
     }
     if !a.ids {
         let tail = dec.flush();
@@ -732,25 +735,26 @@ fn measure(
     ids: &[u32],
     n_predict: usize,
     greedy: bool,
+    repeat_penalty: f32,
 ) -> Result<(f64, f64, usize)> {
-    let mut params = SamplingParams::default();
+    let mut params = SamplingParams {
+        repeat_penalty,
+        ..SamplingParams::default()
+    };
     if greedy {
         params.temperature = 0.0;
     }
     let mut seq = eng.new_seq(eng.tuning.ctx.max(ids.len() + n_predict + 8), params)?;
-    let (mut logits, pre_s) = prefill(eng, &mut seq, ids)?;
+    let (logits, pre_s) = prefill(eng, &mut seq, ids)?;
     let t0 = Instant::now();
+    let mut next = seq.sample(&logits);
     let mut n = 0usize;
-    while n < n_predict {
-        let next = seq.sample(&logits);
+    while n < n_predict && seq.n_past < seq.kv.cap {
+        next = eng.step_sample(&mut seq, &[next])?;
         n += 1;
-        if seq.n_past + 1 > seq.kv.cap {
-            break;
-        }
-        logits = eng.step(&mut seq, &[next], true)?;
     }
     let dec_s = t0.elapsed().as_secs_f64();
-    Ok((ids.len() as f64 / pre_s, (n - 1) as f64 / dec_s, n))
+    Ok((ids.len() as f64 / pre_s, n as f64 / dec_s, n))
 }
 
 fn bench(a: BenchArgs) -> Result<()> {
@@ -758,11 +762,11 @@ fn bench(a: BenchArgs) -> Result<()> {
     let mut eng = a.m.engine(tuning.clone())?;
     let ids = bench_prompt(&eng, a.prompt_tokens);
     // warm up: first launch pays module load and page faults
-    let _ = measure(&mut eng, &ids, 8, true)?;
+    let _ = measure(&mut eng, &ids, 8, true, 1.05)?;
     let mut best_pp = 0f64;
     let mut best_tg = 0f64;
     for _ in 0..a.reps.max(1) {
-        let (pp, tg, n) = measure(&mut eng, &ids, a.n_predict, a.greedy != 0)?;
+        let (pp, tg, n) = measure(&mut eng, &ids, a.n_predict, a.greedy != 0, a.repeat_penalty)?;
         best_pp = best_pp.max(pp);
         best_tg = best_tg.max(tg);
         println!("pp{} {:.0} tok/s   tg{} {:.1} tok/s", ids.len(), pp, n, tg);
@@ -782,7 +786,7 @@ fn tune(a: TuneArgs) -> Result<()> {
     let ids = bench_prompt(&eng0, a.prompt_tokens);
     drop(eng0);
     let mut eng = a.m.engine(tuning.clone())?;
-    let _ = measure(&mut eng, &ids, 8, true)?;
+    let _ = measure(&mut eng, &ids, 8, true, 1.05)?;
 
     let mut best = (tuning.attn_splits, tuning.prefill_cols, 0f64, 0f64);
     println!("splits  prefill_cols      pp tok/s    tg tok/s");
@@ -793,7 +797,7 @@ fn tune(a: TuneArgs) -> Result<()> {
             let mut pp_best = 0f64;
             let mut tg_best = 0f64;
             for _ in 0..a.reps.max(1) {
-                let (pp, tg, _) = measure(&mut eng, &ids, a.n_predict, true)?;
+                let (pp, tg, _) = measure(&mut eng, &ids, a.n_predict, true, 1.05)?;
                 pp_best = pp_best.max(pp);
                 tg_best = tg_best.max(tg);
             }

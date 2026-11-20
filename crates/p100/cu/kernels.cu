@@ -13,6 +13,7 @@
 //     and Q6_K is repacked by the loader to 224 B with ql/hi at fixed offsets.
 
 #include <cuda_fp16.h>
+#include <math_constants.h>
 #include <cstdint>
 
 #define WARP 32
@@ -401,6 +402,54 @@ gemv_body(const char* __restrict__ W, int64_t row_stride,
             }
         }
     }
+}
+
+// The host's greedy scan breaks ties by keeping the lowest token ID.
+__device__ unsigned long long logit_key(float value, unsigned int id) {
+    if (isnan(value)) {
+        if (id != 0) return 0;
+        value = CUDART_INF_F;
+    }
+    unsigned int bits = __float_as_uint(value == 0.0f ? 0.0f : value);
+    bits ^= (bits & 0x80000000u) ? 0xffffffffu : 0x80000000u;
+    return ((unsigned long long)bits << 32) | ~id;
+}
+
+__device__ unsigned long long reduce_logit_key(unsigned long long key) {
+    __shared__ unsigned long long warp_keys[8];
+    const int lane = threadIdx.x & 31;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const auto other = __shfl_down_sync(0xffffffffu, key, offset);
+        key = key > other ? key : other;
+    }
+    if (lane == 0) warp_keys[threadIdx.x >> 5] = key;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        key = lane < 8 ? warp_keys[lane] : 0;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const auto other = __shfl_down_sync(0xffffffffu, key, offset);
+            key = key > other ? key : other;
+        }
+    }
+    return key;
+}
+
+extern "C" __global__ void argmax_logits(const float* logits, int n,
+                                         unsigned long long* partial) {
+    unsigned long long best = 0;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) {
+        const auto next = logit_key(logits[i], i);
+        best = best > next ? best : next;
+    }
+    best = reduce_logit_key(best);
+    if (threadIdx.x == 0) partial[blockIdx.x] = best;
+}
+
+extern "C" __global__ void argmax_finish(const unsigned long long* partial, int blocks,
+                                         unsigned int* token) {
+    auto best = reduce_logit_key(threadIdx.x < blocks ? partial[threadIdx.x] : 0);
+    if (threadIdx.x == 0) *token = ~(unsigned int)best;
 }
 
 // Plain C symbols: the Rust launcher looks kernels up by name, so no mangling.

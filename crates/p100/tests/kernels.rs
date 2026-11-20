@@ -1318,3 +1318,30 @@ fn gemv_split_bandwidth() {
         println!("{line}");
     }
 }
+
+#[test]
+fn greedy_argmax_matches_host() {
+    let Some(dev) = have_gpu() else { return };
+    let kernels = Kernels::load(&dev).unwrap();
+    let partial_bytes = trav_p100::kernels::ARGMAX_BLOCKS * 8;
+    let scratch = dev.alloc(partial_bytes + 4).unwrap();
+    let vocab = 152_064;
+    let mut logits = vec![-10.0f32; vocab + 1];
+    for (first, value, expected) in [
+        (-10.0, 9.0, vocab / 2),
+        (-10.0, -0.0, vocab / 2),
+        (f32::NAN, f32::INFINITY, 0),
+        (f32::NEG_INFINITY, f32::INFINITY, vocab / 2),
+    ] {
+        logits[0] = f32::INFINITY; // outside the slice passed to the kernel
+        logits[1] = first;
+        logits[2] = f32::NAN;
+        logits[1 + vocab / 2] = value;
+        logits[vocab] = if value == 0.0 { 0.0 } else { value };
+        let device_logits = dev.upload(as_bytes(&logits)).unwrap();
+        kernels.argmax(&device_logits, 4, vocab, &scratch).unwrap();
+        let mut token = [0u32];
+        scratch.download_at(partial_bytes, as_bytes_mut(&mut token)).unwrap();
+        assert_eq!(token[0] as usize, expected);
+    }
+}

@@ -136,6 +136,7 @@ struct Scratch {
     ayh: Buf,
     ays: Buf,
     logits: Buf,
+    argmax: Buf,
     ids: Buf,
     pos: Buf,
     inv_freq: Buf,
@@ -179,6 +180,7 @@ impl Scratch {
             ayh: dev.alloc_zeroed(tc * ff * 2)?,
             ays: dev.alloc_zeroed(tc * (ff / 16) * 8)?,
             logits: dev.alloc(tc * hp.vocab * 4)?,
+            argmax: dev.alloc(trav_p100::kernels::ARGMAX_BLOCKS * 8 + 4)?,
             ids: dev.alloc(tc * 4)?,
             pos: dev.alloc(tc * 4)?,
             inv_freq: inv_buf,
@@ -304,8 +306,53 @@ impl Engine {
         self.step_mode(s, toks, if want_logits { 1 } else { 0 })
     }
 
-    /// `mode`: 0 = no logits, 1 = last column, 2 = all columns.
+    /// Advance the sequence and sample from the last token's logits.
+    pub fn step_sample(&mut self, s: &mut Seq, toks: &[u32]) -> Result<u32> {
+        if s.params.temperature <= 0.0
+            && (s.params.repeat_penalty == 1.0 || s.params.repeat_last_n == 0)
+            && std::env::var_os("TRAV_CPU_GREEDY").is_none()
+        {
+            let off = self.forward(s, toks, 1)?;
+            let d = self.model.out_dev;
+            let sc = &self.scratch[d];
+            self.model.kernels[d].argmax(&sc.logits, off, self.model.hp.vocab, &sc.argmax)?;
+            let mut token = [0u32];
+            sc.argmax.download_at(trav_p100::kernels::ARGMAX_BLOCKS * 8,
+                                  as_bytes_mut(&mut token))?;
+            return Ok(token[0]);
+        }
+        let logits = self.step(s, toks, true)?;
+        Ok(s.sample(&logits))
+    }
+
     fn step_mode(&mut self, s: &mut Seq, toks: &[u32], mode: u8) -> Result<Vec<f32>> {
+        let off = self.forward(s, toks, mode)?;
+        let tc = toks.len();
+        let vocab = self.model.hp.vocab;
+        match mode {
+            1 => {
+                let d = self.model.out_dev;
+                self.scratch[d].logits.download_at(
+                    off,
+                    &mut self.logits_host.as_mut_slice()[..vocab * 4],
+                )?;
+                let mut out = vec![0f32; vocab];
+                out.copy_from_slice(&self.logits_host.as_f32(vocab)[..vocab]);
+                Ok(out)
+            }
+            2 => {
+                let mut out = vec![0f32; tc * vocab];
+                let d = self.model.out_dev;
+                self.scratch[d].logits.download_at(0, as_bytes_mut(&mut out))?;
+                Ok(out)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Run the tile and return the byte offset of the requested logits.
+    /// `mode`: 0 = no logits, 1 = last column, 2 = all columns.
+    fn forward(&mut self, s: &mut Seq, toks: &[u32], mode: u8) -> Result<usize> {
         if toks.is_empty() {
             bail!("empty tile");
         }
@@ -386,28 +433,7 @@ impl Engine {
         };
         s.n_past += tc;
         s.tokens.extend_from_slice(toks);
-        let vocab = self.model.hp.vocab;
-        match mode {
-            1 => {
-                let d = self.model.out_dev;
-                self.scratch[d].logits.download_at(
-                    off,
-                    &mut self.logits_host.as_mut_slice()[..vocab * 4],
-                )?;
-                let mut out = vec![0f32; vocab];
-                out.copy_from_slice(&self.logits_host.as_f32(vocab)[..vocab]);
-                Ok(out)
-            }
-            2 => {
-                let mut out = vec![0f32; tc * vocab];
-                let d = self.model.out_dev;
-                self.scratch[d]
-                    .logits
-                    .download_at(0, as_bytes_mut(&mut out))?;
-                Ok(out)
-            }
-            _ => Ok(Vec::new()),
-        }
+        Ok(off)
     }
 
     /// Prefill a prompt in tiles, then decode up to `max_new` tokens. Returns the
@@ -435,19 +461,23 @@ impl Engine {
         s.tokens.clear();
         s.n_past = 0;
         let cols = self.tuning.prefill_cols.clamp(1, MAX_PREFILL_COLS);
-        let mut logits = Vec::new();
         let mut i = 0;
-        while i < prompt.len() {
+        let mut next = loop {
             let n = prefill_tile(cols, prompt.len() - i);
-            let last = i + n == prompt.len();
-            logits = self.step(s, &prompt[i..i + n], last)?;
+            if i + n == prompt.len() {
+                if max_new == 0 {
+                    self.step(s, &prompt[i..], true)?;
+                    return Ok(0);
+                }
+                break self.step_sample(s, &prompt[i..])?;
+            }
+            self.step(s, &prompt[i..i + n], false)?;
             i += n;
-        }
+        };
 
         let mut generated = 0usize;
         let mut dec = crate::tokenizer::StreamDecoder::default();
         while generated < max_new {
-            let next = s.sample(&logits);
             if s.stop.contains(&next) {
                 break;
             }
@@ -459,7 +489,7 @@ impl Engine {
             if generated >= max_new || s.n_past + 1 > s.kv.cap {
                 break;
             }
-            logits = self.step(s, &[next], true)?;
+            next = self.step_sample(s, &[next])?;
         }
         let tail = dec.flush();
         if !tail.is_empty() {
